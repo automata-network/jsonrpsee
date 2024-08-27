@@ -32,6 +32,9 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
+use std::io::{self, BufReader as IoBufReader, ErrorKind};
+use std::path::Path;
+use std::fs::File;
 
 use crate::future::{session_close, ConnectionGuard, ServerHandle, SessionClose, SessionClosedFuture, StopHandle};
 use crate::middleware::rpc::{RpcService, RpcServiceBuilder, RpcServiceCfg, RpcServiceT};
@@ -60,46 +63,141 @@ use jsonrpsee_types::{ErrorObject, Id, InvalidRequest, Notification};
 use soketto::handshake::http::is_upgrade_request;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit};
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tower::layer::util::Identity;
 use tower::{Layer, Service};
 use tracing::{instrument, Instrument};
+
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 type Notif<'a> = Notification<'a, Option<&'a JsonRawValue>>;
 
 /// Default maximum connections allowed.
 const MAX_CONNECTIONS: u32 = 100;
 
+/// Transport Layer Trait
+pub trait TransportLayer {
+	///
+	type Config: Send;
+
+	///
+	type Acceptor: Send + Clone;
+
+	///
+	type Stream: Send + tokio::io::AsyncWrite + tokio::io::AsyncRead + Unpin + 'static;
+
+	///
+	fn new_acceptor(cfg: Self::Config) -> Self::Acceptor;
+
+	///
+	fn accept(acceptor: &Self::Acceptor, stream: TcpStream) -> impl Future<Output=std::io::Result<Self::Stream>> + Send;
+
+	///
+	fn set_nodelay(stream: &Self::Stream, nodelay: bool) -> std::io::Result<()>;
+}
+
+/// TCP Middle Layer (Default)
+#[derive(Clone, Debug, Copy)]
+pub struct TcpLayer {}
+impl TransportLayer for TcpLayer {
+	type Acceptor = ();
+	type Config = ();
+	type Stream = TcpStream;
+	fn new_acceptor(_: Self::Config) -> Self::Acceptor {
+		()
+	}
+	fn accept(_acceptor: &Self::Acceptor, stream: TcpStream) -> impl Future<Output=std::io::Result<Self::Stream>> + Send{
+		async {
+			Ok(stream)
+		}
+	}
+	fn set_nodelay(stream: &Self::Stream, nodelay: bool) -> std::io::Result<()> {
+		stream.set_nodelay(nodelay)
+	}
+}
+
+/// TLS Middle Layer
+#[derive(Clone, Debug, Copy)]
+pub struct TlsLayer {}
+impl TransportLayer for TlsLayer {
+	type Config = rustls::ServerConfig;
+	type Acceptor = TlsAcceptor;
+	type Stream = TlsStream<TcpStream>;
+	fn new_acceptor(cfg: Self::Config) -> Self::Acceptor {
+		TlsAcceptor::from(Arc::new(cfg))
+	}
+	fn accept(acceptor: &Self::Acceptor, stream: TcpStream) -> impl Future<Output=std::io::Result<Self::Stream>> {
+		acceptor.accept(stream)
+	}
+	fn set_nodelay(_: &Self::Stream, _: bool) -> std::io::Result<()> {
+		Ok(())
+	}
+}
+
+impl TlsLayer {
+	/// generate config with single cert path
+	pub fn single_cert_with_path(certs: &Path, key: &Path) -> io::Result<rustls::ServerConfig> {
+		let certs = Self::load_certs(certs)?;
+		let key = Self::load_key(key)?;
+		Self::single_cert(certs, key)
+	}
+
+	/// generate config with single cert
+	pub fn single_cert(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> io::Result<rustls::ServerConfig> {
+		rustls::ServerConfig::builder()
+			.with_no_client_auth()
+			.with_single_cert(certs, key)
+			.map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+	}
+
+	/// load certs with path
+	pub fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
+		rustls_pemfile::certs(&mut IoBufReader::new(File::open(path)?)).collect()
+	}
+
+	/// load key with path
+	pub fn load_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
+		Ok(rustls_pemfile::private_key(&mut IoBufReader::new(File::open(path)?))?
+			.ok_or(io::Error::new(
+				ErrorKind::Other,
+				"no private key found".to_string(),
+			))?)
+	}
+}
+
 /// JSON RPC server.
-pub struct Server<HttpMiddleware = Identity, RpcMiddleware = Identity> {
+pub struct Server<T: TransportLayer, HttpMiddleware = Identity, RpcMiddleware = Identity> {
 	listener: TcpListener,
+	transport_cfg: T::Config,
 	server_cfg: ServerConfig,
 	rpc_middleware: RpcServiceBuilder<RpcMiddleware>,
 	http_middleware: tower::ServiceBuilder<HttpMiddleware>,
 }
 
-impl Server<Identity, Identity> {
+impl Server<TcpLayer, Identity, Identity> {
 	/// Create a builder for the server.
-	pub fn builder() -> Builder<Identity, Identity> {
+	pub fn builder() -> Builder<TcpLayer, Identity, Identity> {
 		Builder::new()
 	}
 }
 
-impl<RpcMiddleware, HttpMiddleware> std::fmt::Debug for Server<RpcMiddleware, HttpMiddleware> {
+impl<T: TransportLayer, RpcMiddleware, HttpMiddleware> std::fmt::Debug for Server<T, RpcMiddleware, HttpMiddleware> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("Server").field("listener", &self.listener).field("server_cfg", &self.server_cfg).finish()
 	}
 }
 
-impl<RpcMiddleware, HttpMiddleware> Server<RpcMiddleware, HttpMiddleware> {
+impl<T: TransportLayer, RpcMiddleware, HttpMiddleware> Server<T, RpcMiddleware, HttpMiddleware> {
 	/// Returns socket address to which the server is bound.
 	pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
 		self.listener.local_addr()
 	}
 }
 
-impl<HttpMiddleware, RpcMiddleware, Body> Server<HttpMiddleware, RpcMiddleware>
+impl<T, HttpMiddleware, RpcMiddleware, Body> Server<T, HttpMiddleware, RpcMiddleware>
 where
+	T: TransportLayer + 'static,
 	RpcMiddleware: tower::Layer<RpcService> + Clone + Send + 'static,
 	for<'a> <RpcMiddleware as Layer<RpcService>>::Service: RpcServiceT<'a>,
 	HttpMiddleware: Layer<TowerServiceNoHttp<RpcMiddleware>> + Send + 'static,
@@ -131,6 +229,7 @@ where
 		let mut id: u32 = 0;
 		let connection_guard = ConnectionGuard::new(self.server_cfg.max_connections as usize);
 		let listener = self.listener;
+		let acceptor = T::new_acceptor(self.transport_cfg);
 
 		let stopped = stop_handle.clone().shutdown();
 		tokio::pin!(stopped);
@@ -138,9 +237,9 @@ where
 		let (drop_on_completion, mut process_connection_awaiter) = mpsc::channel::<()>(1);
 
 		loop {
-			match try_accept_conn(&listener, stopped).await {
+			match try_accept_conn::<_, T>(&listener, acceptor.clone(), stopped).await {
 				AcceptConnection::Established { socket, remote_addr, stop } => {
-					process_connection(ProcessConnection {
+					process_connection(ProcessConnection::<T, _, _> {
 						http_middleware: &self.http_middleware,
 						rpc_middleware: self.rpc_middleware.clone(),
 						remote_addr,
@@ -457,23 +556,25 @@ impl ServerConfigBuilder {
 
 /// Builder to configure and create a JSON-RPC server
 #[derive(Debug)]
-pub struct Builder<HttpMiddleware, RpcMiddleware> {
+pub struct Builder<T: TransportLayer, HttpMiddleware, RpcMiddleware> {
 	server_cfg: ServerConfig,
+	transport_cfg: T::Config,
 	rpc_middleware: RpcServiceBuilder<RpcMiddleware>,
 	http_middleware: tower::ServiceBuilder<HttpMiddleware>,
 }
 
-impl Default for Builder<Identity, Identity> {
+impl Default for Builder<TcpLayer, Identity, Identity> {
 	fn default() -> Self {
 		Builder {
 			server_cfg: ServerConfig::default(),
+			transport_cfg: (),
 			rpc_middleware: RpcServiceBuilder::new(),
 			http_middleware: tower::ServiceBuilder::new(),
 		}
 	}
 }
 
-impl Builder<Identity, Identity> {
+impl Builder<TcpLayer, Identity, Identity> {
 	/// Create a default server builder.
 	pub fn new() -> Self {
 		Self::default()
@@ -544,7 +645,14 @@ impl<RpcMiddleware, HttpMiddleware> TowerServiceBuilder<RpcMiddleware, HttpMiddl
 	}
 }
 
-impl<HttpMiddleware, RpcMiddleware> Builder<HttpMiddleware, RpcMiddleware> {
+impl<HttpMiddleware, RpcMiddleware> Builder<TcpLayer, HttpMiddleware, RpcMiddleware> {
+	/// Set the tls certs
+	pub fn set_transport_cfg(self, cfg: <TlsLayer as TransportLayer>::Config) -> Builder<TlsLayer, HttpMiddleware, RpcMiddleware> {
+		Builder { transport_cfg: cfg, server_cfg: self.server_cfg, rpc_middleware: self.rpc_middleware, http_middleware: self.http_middleware }
+	}
+}
+
+impl<TL: TransportLayer, HttpMiddleware, RpcMiddleware> Builder<TL, HttpMiddleware, RpcMiddleware> {
 	/// Set the maximum size of a request body in bytes. Default is 10 MiB.
 	pub fn max_request_body_size(mut self, size: u32) -> Self {
 		self.server_cfg.max_request_body_size = size;
@@ -636,8 +744,8 @@ impl<HttpMiddleware, RpcMiddleware> Builder<HttpMiddleware, RpcMiddleware> {
 	/// let m = RpcServiceBuilder::new().layer_fn(move |service: ()| MyMiddleware { service, count: Arc::new(AtomicUsize::new(0)) });
 	/// let builder = ServerBuilder::default().set_rpc_middleware(m);
 	/// ```
-	pub fn set_rpc_middleware<T>(self, rpc_middleware: RpcServiceBuilder<T>) -> Builder<HttpMiddleware, T> {
-		Builder { server_cfg: self.server_cfg, rpc_middleware, http_middleware: self.http_middleware }
+	pub fn set_rpc_middleware<T>(self, rpc_middleware: RpcServiceBuilder<T>) -> Builder<TL, HttpMiddleware, T> {
+		Builder { transport_cfg: self.transport_cfg, server_cfg: self.server_cfg, rpc_middleware, http_middleware: self.http_middleware }
 	}
 
 	/// Configure a custom [`tokio::runtime::Handle`] to run the server on.
@@ -722,8 +830,8 @@ impl<HttpMiddleware, RpcMiddleware> Builder<HttpMiddleware, RpcMiddleware> {
 	///         .unwrap();
 	/// }
 	/// ```
-	pub fn set_http_middleware<T>(self, http_middleware: tower::ServiceBuilder<T>) -> Builder<T, RpcMiddleware> {
-		Builder { server_cfg: self.server_cfg, http_middleware, rpc_middleware: self.rpc_middleware }
+	pub fn set_http_middleware<T>(self, http_middleware: tower::ServiceBuilder<T>) -> Builder<TL, T, RpcMiddleware> {
+		Builder { transport_cfg: self.transport_cfg, server_cfg: self.server_cfg, http_middleware, rpc_middleware: self.rpc_middleware }
 	}
 
 	/// Configure `TCP_NODELAY` on the socket to the supplied value `nodelay`.
@@ -882,11 +990,12 @@ impl<HttpMiddleware, RpcMiddleware> Builder<HttpMiddleware, RpcMiddleware> {
 	/// }
 	/// ```
 	///
-	pub async fn build(self, addrs: impl ToSocketAddrs) -> std::io::Result<Server<HttpMiddleware, RpcMiddleware>> {
+	pub async fn build(self, addrs: impl ToSocketAddrs) -> std::io::Result<Server<TL, HttpMiddleware, RpcMiddleware>> {
 		let listener = TcpListener::bind(addrs).await?;
 
 		Ok(Server {
 			listener,
+			transport_cfg: self.transport_cfg,
 			server_cfg: self.server_cfg,
 			rpc_middleware: self.rpc_middleware,
 			http_middleware: self.http_middleware,
@@ -919,11 +1028,12 @@ impl<HttpMiddleware, RpcMiddleware> Builder<HttpMiddleware, RpcMiddleware> {
 	pub fn build_from_tcp(
 		self,
 		listener: impl Into<StdTcpListener>,
-	) -> std::io::Result<Server<HttpMiddleware, RpcMiddleware>> {
+	) -> std::io::Result<Server<TL, HttpMiddleware, RpcMiddleware>> {
 		let listener = TcpListener::from_std(listener.into())?;
 
 		Ok(Server {
 			listener,
+			transport_cfg: self.transport_cfg,
 			server_cfg: self.server_cfg,
 			rpc_middleware: self.rpc_middleware,
 			http_middleware: self.http_middleware,
@@ -1158,22 +1268,23 @@ where
 	}
 }
 
-struct ProcessConnection<'a, HttpMiddleware, RpcMiddleware> {
+struct ProcessConnection<'a, T: TransportLayer, HttpMiddleware, RpcMiddleware> {
 	http_middleware: &'a tower::ServiceBuilder<HttpMiddleware>,
 	rpc_middleware: RpcServiceBuilder<RpcMiddleware>,
 	conn_guard: &'a ConnectionGuard,
 	conn_id: u32,
 	server_cfg: ServerConfig,
 	stop_handle: StopHandle,
-	socket: TcpStream,
+	socket: T::Stream,
 	drop_on_completion: mpsc::Sender<()>,
 	remote_addr: SocketAddr,
 	methods: Methods,
 }
 
 #[instrument(name = "connection", skip_all, fields(remote_addr = %params.remote_addr, conn_id = %params.conn_id), level = "INFO")]
-fn process_connection<'a, RpcMiddleware, HttpMiddleware, Body>(params: ProcessConnection<HttpMiddleware, RpcMiddleware>)
+fn process_connection<'a, TL, RpcMiddleware, HttpMiddleware, Body>(params: ProcessConnection<TL, HttpMiddleware, RpcMiddleware>)
 where
+	TL: TransportLayer,
 	RpcMiddleware: 'static,
 	HttpMiddleware: Layer<TowerServiceNoHttp<RpcMiddleware>> + Send + 'static,
 	<HttpMiddleware as Layer<TowerServiceNoHttp<RpcMiddleware>>>::Service:
@@ -1197,7 +1308,7 @@ where
 		..
 	} = params;
 
-	if let Err(e) = socket.set_nodelay(server_cfg.tcp_no_delay) {
+	if let Err(e) = TL::set_nodelay(&socket, server_cfg.tcp_no_delay) {
 		tracing::warn!(target: LOG_TARGET, "Could not set NODELAY on socket: {:?}", e);
 		return;
 	}
@@ -1244,22 +1355,28 @@ where
 	});
 }
 
-enum AcceptConnection<S> {
+enum AcceptConnection<S, T: TransportLayer> {
 	Shutdown,
-	Established { socket: TcpStream, remote_addr: SocketAddr, stop: S },
+	Established { socket: T::Stream, remote_addr: SocketAddr, stop: S },
 	Err((std::io::Error, S)),
 }
 
-async fn try_accept_conn<S>(listener: &TcpListener, stopped: S) -> AcceptConnection<S>
+async fn try_accept_conn<S, T>(listener: &TcpListener, acceptor: T::Acceptor, stopped: S) -> AcceptConnection<S, T>
 where
 	S: Future + Unpin,
+	T: TransportLayer,
 {
 	let accept = listener.accept();
 	tokio::pin!(accept);
 
 	match futures_util::future::select(accept, stopped).await {
 		Either::Left((res, stop)) => match res {
-			Ok((socket, remote_addr)) => AcceptConnection::Established { socket, remote_addr, stop },
+			Ok((socket, remote_addr)) => {
+				match T::accept(&acceptor, socket).await {
+					Ok(socket) => AcceptConnection::Established { socket, remote_addr, stop },
+					Err(e) => AcceptConnection::Err((e, stop)),
+				}
+			},
 			Err(e) => AcceptConnection::Err((e, stop)),
 		},
 		Either::Right(_) => AcceptConnection::Shutdown,
