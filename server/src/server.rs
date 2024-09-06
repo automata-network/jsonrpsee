@@ -31,7 +31,7 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Instant, Duration};
 use std::io::{self, BufReader as IoBufReader, ErrorKind};
 use std::path::Path;
 use std::fs::File;
@@ -300,6 +300,8 @@ pub struct ServerConfig {
 	pub(crate) id_provider: Arc<dyn IdProvider>,
 	/// `TCP_NODELAY` settings.
 	pub(crate) tcp_no_delay: bool,
+	/// idle timeout for reading first request, default 60s
+	pub(crate) idle_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +451,7 @@ impl Default for ServerConfig {
 			ping_config: None,
 			id_provider: Arc::new(RandomIntegerIdProvider),
 			tcp_no_delay: true,
+			idle_timeout: Duration::from_secs(60),
 		}
 	}
 }
@@ -772,6 +775,14 @@ impl<TL: TransportLayer, HttpMiddleware, RpcMiddleware> Builder<TL, HttpMiddlewa
 	/// ```
 	pub fn enable_ws_ping(mut self, config: PingConfig) -> Self {
 		self.server_cfg.ping_config = Some(config);
+		self
+	}
+
+	/// Add IdleTimeout
+	///
+	/// Default: 60s
+	pub fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
+		self.server_cfg.idle_timeout = idle_timeout;
 		self
 	}
 
@@ -1313,6 +1324,8 @@ where
 		return;
 	}
 
+	let idle_timeout = server_cfg.idle_timeout;
+
 	let tower_service = TowerServiceNoHttp {
 		inner: ServiceData {
 			server_cfg,
@@ -1327,14 +1340,14 @@ where
 
 	let service = http_middleware.service(tower_service);
 
-	tokio::spawn(async {
+	tokio::spawn(async move {
 		// this requires Clone.
 		let service = crate::utils::TowerToHyperService::new(service);
 		let io = TokioIo::new(socket);
 		let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
 
 		let conn = builder.serve_connection_with_upgrades(io, service);
-		let stopped = stop_handle.shutdown();
+		let stopped = tokio::time::timeout(idle_timeout, stop_handle.shutdown());
 
 		tokio::pin!(stopped, conn);
 
@@ -1397,7 +1410,11 @@ where
 	// Single request or notification
 	if is_single {
 		if let Ok(req) = deserialize::from_slice_with_extensions(body, extensions) {
-			Some(rpc_service.call(req).await)
+			let now = Instant::now();
+			let method = req.method.clone();
+			let rp = rpc_service.call(req).await;
+			tracing::info!(target: LOG_TARGET, "[elapsed={:?}] served jsonrpc {}", now.elapsed(), method);
+			Some(rp)
 		} else if let Ok(_notif) = serde_json::from_slice::<Notif>(body) {
 			None
 		} else {
@@ -1429,8 +1446,10 @@ where
 
 			for call in batch {
 				if let Ok(req) = deserialize::from_str_with_extensions(call.get(), extensions.clone()) {
+					let now = Instant::now();
+					let method = req.method.clone();
 					let rp = rpc_service.call(req).await;
-
+					tracing::info!(target: LOG_TARGET, "[elapsed={:?}] served jsonrpc {}", now.elapsed(), method);
 					if let Err(too_large) = batch_response.append(&rp) {
 						return Some(too_large);
 					}

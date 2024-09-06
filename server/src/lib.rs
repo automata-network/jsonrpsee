@@ -52,6 +52,7 @@ pub use server::{
 	TowerServiceBuilder, TlsLayer, TcpLayer
 };
 pub use tracing;
+pub use tower;
 
 pub use jsonrpsee_core::http_helpers::{Body as HttpBody, Request as HttpRequest, Response as HttpResponse};
 pub use transport::http;
